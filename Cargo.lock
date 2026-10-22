@@ -1076,7 +1076,7 @@ dependencies = [
 
 [[package]]
 name = "mlmake"
-version = "0.1.2"
+version = "0.0.1"
 dependencies = [
  "brush-builtins",
  "brush-core",

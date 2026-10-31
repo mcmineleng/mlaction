@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Read, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::Arc;
@@ -14,6 +14,20 @@ use brush_core::{
 };
 use clap::Parser;
 use serde::Deserialize;
+
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{self as cterm, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Alignment, Constraint, Direction, Layout},
+    style::{Color as TuiColor, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, Paragraph},
+    Frame, Terminal,
+};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const PKG_NAME: &str = env!("CARGO_PKG_NAME");
@@ -73,8 +87,28 @@ impl Default for GlobalSettings {
 struct BuildFile {
     #[serde(rename = "task", default)]
     tasks: Vec<Task>,
+    #[serde(rename = "input", default)]
+    inputs: Vec<Input>,
     #[serde(default)]
     settings: GlobalSettings,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct Input {
+    #[serde(rename = "type")]
+    input_type: String,
+    name: String,
+    key: String,
+    #[serde(default)]
+    require: bool,
+    #[serde(default)]
+    choose: Vec<Choose>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct Choose {
+    name: String,
+    key: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -82,7 +116,9 @@ struct Task {
     name: String,
     value: String,
     #[serde(default)]
-    cmduse: bool,
+    run_cond: Option<String>,
+    #[serde(default)]
+    require_success: bool,
     #[serde(default)]
     settings: TaskSettings,
     #[serde(rename = "step", default)]
@@ -106,6 +142,16 @@ struct Action {
     run: String,
 }
 
+// ============== 输入的收集值 ==============
+#[derive(Debug, Clone)]
+enum InputValue {
+    String(String),
+    Int(String),
+    Bool(Option<bool>),
+    OnlyChose(Option<usize>),
+    ManyChose(Vec<usize>),
+}
+
 // ============== 日志 ==============
 fn log_line(show: bool, level: usize, label: &str, name: &str, status: String) {
     if !show {
@@ -117,10 +163,6 @@ fn log_line(show: bool, level: usize, label: &str, name: &str, status: String) {
         "STEP" => color::BLUE,
         _ => color::RESET,
     };
-    // raw mode 下 \n 只下移不回列 0，因此：
-    //   - 行首用 \r\x1b[K：回到列 0 并清掉当前行（吃掉 PTY 输出可能残留的半行）
-    //   - 行尾用 \r\n：下移一行并回到列 0
-    // 不要在前面再塞 \r\n，否则每条日志前会多出一个空行。
     let mut out = std::io::stdout().lock();
     let _ = write!(
         out,
@@ -140,17 +182,17 @@ fn s_start() -> String { format!("{}[开始]{}", color::YELLOW, color::RESET) }
 fn s_ok() -> String { format!("{}[成功]{}", color::GREEN, color::RESET) }
 fn s_fail(c: i32) -> String { format!("{}[失败({})]{}", color::RED, c, color::RESET) }
 fn s_interrupt() -> String { format!("{}[中断(Ctrl+C)]{}", color::RED, color::RESET) }
+fn s_skip(reason: &str) -> String {
+    format!("{}[跳过({})]{}", color::YELLOW, reason, color::RESET)
+}
 
-// 统一的错误输出（raw mode 下需要用 \r\n）
 fn err_line(msg: String) {
     let mut out = std::io::stdout().lock();
     let _ = write!(out, "\r\x1b[K{msg}\r\n");
     let _ = out.flush();
 }
 
-// ============== 终端 raw mode guard（保留 ISIG） ==============
-/// RAII guard：进入时把本地终端设为 raw mode 但保留 ISIG（Ctrl+C 产生 SIGINT），
-/// drop 时恢复。即使 task 执行期间 panic，终端也会被恢复。
+// ============== 终端 raw mode guard ==============
 struct RawModeGuard {
     original: Option<libc::termios>,
 }
@@ -160,23 +202,17 @@ impl RawModeGuard {
         if !std::io::stdin().is_terminal() {
             return Self { original: None };
         }
-
         unsafe {
             let mut original: libc::termios = std::mem::zeroed();
             if libc::tcgetattr(libc::STDIN_FILENO, &mut original) != 0 {
                 return Self { original: None };
             }
-
             let mut raw = original;
-            // cfmakeraw：关闭 ICANON/ECHO/IEXTEN 等，但会同时关掉 ISIG
             libc::cfmakeraw(&mut raw);
-            // 手动把 ISIG 加回来 —— Ctrl+C 仍然产生 SIGINT
             raw.c_lflag |= libc::ISIG;
-
             if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) != 0 {
                 return Self { original: None };
             }
-
             Self { original: Some(original) }
         }
     }
@@ -192,13 +228,540 @@ impl Drop for RawModeGuard {
     }
 }
 
+// ============== TUI：输入收集 ==============
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Inputs,
+    Cancel,
+    Confirm,
+    Fill,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    Main,
+    Edit,
+}
+
+#[derive(Debug, Clone, Default)]
+struct EditState {
+    text: String,
+    cursor: usize,
+}
+
+#[derive(Debug)]
+struct InputApp {
+    defs: Vec<Input>,
+    values: Vec<Option<InputValue>>,
+    active: usize,
+    focus: Focus,
+    screen: Screen,
+    edit: EditState,
+    message: Option<String>,
+}
+
+enum InputAction {
+    None,
+    Submit,
+    Cancel,
+}
+
+impl InputApp {
+    fn new(defs: Vec<Input>) -> Self {
+        let n = defs.len();
+        let mut values: Vec<Option<InputValue>> = Vec::with_capacity(n);
+        for d in &defs {
+            let v = match d.input_type.as_str() {
+                "string" => Some(InputValue::String(String::new())),
+                "int" => Some(InputValue::Int(String::new())),
+                "bool" => Some(InputValue::Bool(None)),
+                "only_chose" => Some(InputValue::OnlyChose(None)),
+                "many_chose" => Some(InputValue::ManyChose(Vec::new())),
+                _ => None,
+            };
+            values.push(v);
+        }
+        Self {
+            defs,
+            values,
+            active: 0,
+            focus: Focus::Inputs,
+            screen: Screen::Main,
+            edit: EditState::default(),
+            message: None,
+        }
+    }
+
+    fn validate(&self) -> Option<String> {
+        for (i, def) in self.defs.iter().enumerate() {
+            if !def.require {
+                continue;
+            }
+            let ok = match &self.values[i] {
+                Some(InputValue::String(s)) => !s.is_empty(),
+                Some(InputValue::Int(s)) => !s.is_empty(),
+                Some(InputValue::Bool(Some(_))) => true,
+                Some(InputValue::OnlyChose(Some(_))) => true,
+                Some(InputValue::ManyChose(v)) => !v.is_empty(),
+                _ => false,
+            };
+            if !ok {
+                return Some(format!("\"{}\" 是必填项", def.name));
+            }
+        }
+        None
+    }
+
+    fn into_map(self) -> HashMap<String, InputValue> {
+        let mut m = HashMap::new();
+        for (i, def) in self.defs.into_iter().enumerate() {
+            if let Some(v) = self.values[i].clone() {
+                m.insert(def.key, v);
+            }
+        }
+        m
+    }
+
+    fn enter_edit(&mut self) {
+        let def = &self.defs[self.active];
+        match def.input_type.as_str() {
+            "string" => {
+                self.edit.text = match &self.values[self.active] {
+                    Some(InputValue::String(s)) => s.clone(),
+                    _ => String::new(),
+                };
+            }
+            "int" => {
+                self.edit.text = match &self.values[self.active] {
+                    Some(InputValue::Int(s)) => s.clone(),
+                    _ => String::new(),
+                };
+            }
+            "bool" => {
+                self.edit.cursor = match &self.values[self.active] {
+                    Some(InputValue::Bool(Some(true))) => 0,
+                    Some(InputValue::Bool(Some(false))) => 1,
+                    _ => 0,
+                };
+            }
+            "only_chose" => {
+                self.edit.cursor = match &self.values[self.active] {
+                    Some(InputValue::OnlyChose(Some(i))) => *i,
+                    _ => 0,
+                };
+            }
+            "many_chose" => {
+                self.edit.cursor = 0;
+            }
+            _ => {}
+        }
+        self.screen = Screen::Edit;
+    }
+
+    fn handle_key(&mut self, k: KeyEvent) -> InputAction {
+        // Ctrl+C 在任何界面都视为取消
+        if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+            return InputAction::Cancel;
+        }
+        match self.screen {
+            Screen::Main => self.handle_main(k),
+            Screen::Edit => self.handle_edit(k),
+        }
+    }
+
+    fn handle_main(&mut self, k: KeyEvent) -> InputAction {
+        self.message = None;
+        match k.code {
+            KeyCode::Esc => return InputAction::Cancel,
+            KeyCode::Tab => {
+                self.focus = match self.focus {
+                    Focus::Inputs => Focus::Cancel,
+                    Focus::Cancel => Focus::Confirm,
+                    Focus::Confirm => Focus::Fill,
+                    Focus::Fill => Focus::Inputs,
+                };
+            }
+            KeyCode::BackTab => {
+                self.focus = match self.focus {
+                    Focus::Inputs => Focus::Fill,
+                    Focus::Cancel => Focus::Inputs,
+                    Focus::Confirm => Focus::Cancel,
+                    Focus::Fill => Focus::Confirm,
+                };
+            }
+            KeyCode::Up => {
+                if self.focus == Focus::Inputs && self.active > 0 {
+                    self.active -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if self.focus == Focus::Inputs && self.active + 1 < self.defs.len() {
+                    self.active += 1;
+                }
+            }
+            KeyCode::Enter => match self.focus {
+                Focus::Inputs => self.enter_edit(),
+                Focus::Fill => self.focus = Focus::Inputs,
+                Focus::Cancel => return InputAction::Cancel,
+                Focus::Confirm => return InputAction::Submit,
+            },
+            _ => {}
+        }
+        InputAction::None
+    }
+
+    fn handle_edit(&mut self, k: KeyEvent) -> InputAction {
+        let t = self.defs[self.active].input_type.clone();
+        match t.as_str() {
+            "string" | "int" => match k.code {
+                KeyCode::Enter => {
+                    let val = if t == "int" {
+                        InputValue::Int(self.edit.text.clone())
+                    } else {
+                        InputValue::String(self.edit.text.clone())
+                    };
+                    self.values[self.active] = Some(val);
+                    self.screen = Screen::Main;
+                }
+                KeyCode::Esc => {
+                    self.screen = Screen::Main;
+                }
+                KeyCode::Backspace => {
+                    self.edit.text.pop();
+                }
+                KeyCode::Char(c) => {
+                    if t == "int" && !c.is_ascii_digit() {
+                        return InputAction::None;
+                    }
+                    self.edit.text.push(c);
+                }
+                _ => {}
+            },
+            "bool" => match k.code {
+                KeyCode::Up => self.edit.cursor = 0,
+                KeyCode::Down => self.edit.cursor = 1,
+                KeyCode::Enter => {
+                    self.values[self.active] =
+                        Some(InputValue::Bool(Some(self.edit.cursor == 0)));
+                    self.screen = Screen::Main;
+                }
+                KeyCode::Esc => {
+                    self.screen = Screen::Main;
+                }
+                _ => {}
+            },
+            "only_chose" => {
+                let n = self.defs[self.active].choose.len();
+                match k.code {
+                    KeyCode::Up => {
+                        if self.edit.cursor > 0 {
+                            self.edit.cursor -= 1;
+                        }
+                    }
+                    KeyCode::Down => {
+                        if self.edit.cursor + 1 < n {
+                            self.edit.cursor += 1;
+                        }
+                    }
+                    KeyCode::Enter => {
+                        self.values[self.active] =
+                            Some(InputValue::OnlyChose(Some(self.edit.cursor)));
+                        self.screen = Screen::Main;
+                    }
+                    KeyCode::Esc => {
+                        self.screen = Screen::Main;
+                    }
+                    _ => {}
+                }
+            }
+            "many_chose" => {
+                let n = self.defs[self.active].choose.len();
+                match k.code {
+                    KeyCode::Up => {
+                        if self.edit.cursor > 0 {
+                            self.edit.cursor -= 1;
+                        }
+                    }
+                    KeyCode::Down => {
+                        if self.edit.cursor + 1 < n {
+                            self.edit.cursor += 1;
+                        }
+                    }
+                    KeyCode::Char(' ') => {
+                        let mut v = match &self.values[self.active] {
+                            Some(InputValue::ManyChose(v)) => v.clone(),
+                            _ => Vec::new(),
+                        };
+                        if let Some(pos) = v.iter().position(|&x| x == self.edit.cursor) {
+                            v.remove(pos);
+                        } else {
+                            v.push(self.edit.cursor);
+                        }
+                        v.sort();
+                        self.values[self.active] = Some(InputValue::ManyChose(v));
+                    }
+                    KeyCode::Enter => {
+                        self.screen = Screen::Main;
+                    }
+                    KeyCode::Esc => {
+                        self.screen = Screen::Main;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        InputAction::None
+    }
+
+    fn render(&self, f: &mut Frame) {
+        match self.screen {
+            Screen::Main => self.render_main(f),
+            Screen::Edit => self.render_edit(f),
+        }
+    }
+
+    fn render_main(&self, f: &mut Frame) {
+        let area = f.area();
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(3),
+                Constraint::Length(1),
+                Constraint::Length(3),
+            ])
+            .split(area);
+
+        // 输入项列表
+        let items: Vec<ListItem> = self
+            .defs
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                let marker = if self.focus == Focus::Inputs && i == self.active {
+                    "> "
+                } else {
+                    "  "
+                };
+                let require_mark = if d.require { " *" } else { "" };
+                ListItem::new(Line::from(format!(
+                    "{}[{}] {}{}",
+                    marker, d.input_type, d.name, require_mark
+                )))
+            })
+            .collect();
+
+        let list = List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" 请填写配置（回车进入编辑） "),
+        );
+        f.render_widget(list, chunks[0]);
+
+        // 消息行
+        if let Some(msg) = &self.message {
+            let p = Paragraph::new(msg.as_str())
+                .style(Style::default().fg(TuiColor::Red))
+                .alignment(Alignment::Center);
+            f.render_widget(p, chunks[1]);
+        }
+
+        // 按钮行
+        let focused_idx = match self.focus {
+            Focus::Cancel => Some(0),
+            Focus::Confirm => Some(1),
+            Focus::Fill => Some(2),
+            _ => None,
+        };
+        let labels = [" 取 消 ", " 确 认 ", " 填 写 "];
+        let mut spans: Vec<Span> = Vec::new();
+        for (i, l) in labels.iter().enumerate() {
+            let style = if Some(i) == focused_idx {
+                Style::default()
+                    .bg(TuiColor::Cyan)
+                    .fg(TuiColor::Black)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(TuiColor::Gray)
+            };
+            spans.push(Span::styled(l.to_string(), style));
+            spans.push(Span::raw("    "));
+        }
+        let p = Paragraph::new(Line::from(spans)).alignment(Alignment::Center);
+        f.render_widget(p, chunks[2]);
+    }
+
+    fn render_edit(&self, f: &mut Frame) {
+        let def = &self.defs[self.active];
+        let area = f.area();
+        let title = format!(" {} ({}) ", def.name, def.input_type);
+
+        let text: Vec<Line> = match def.input_type.as_str() {
+            "string" | "int" => {
+                vec![
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(self.edit.text.clone(), Style::default().fg(TuiColor::Cyan)),
+                        Span::styled("█", Style::default().fg(TuiColor::Cyan)),
+                    ]),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  Enter 确认 / Esc 返回",
+                        Style::default().fg(TuiColor::DarkGray),
+                    )),
+                ]
+            }
+            "bool" => {
+                let mut lines = vec![Line::from("")];
+                for (i, label) in ["true", "false"].iter().enumerate() {
+                    let marker = if self.edit.cursor == i { "> " } else { "  " };
+                    let style = if self.edit.cursor == i {
+                        Style::default().fg(TuiColor::Cyan).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}{}", marker, label),
+                        style,
+                    )));
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "  ↑↓ 选择 / Enter 确认 / Esc 返回",
+                    Style::default().fg(TuiColor::DarkGray),
+                )));
+                lines
+            }
+            "only_chose" => {
+                let mut lines = vec![Line::from("")];
+                let sel = match &self.values[self.active] {
+                    Some(InputValue::OnlyChose(Some(i))) => Some(*i),
+                    _ => None,
+                };
+                for (i, c) in def.choose.iter().enumerate() {
+                    let marker = if self.edit.cursor == i { "> " } else { "  " };
+                    let sel_mark = if Some(i) == sel { "(*)" } else { "( )" };
+                    let style = if self.edit.cursor == i {
+                        Style::default().fg(TuiColor::Cyan).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}{} {} [{}]", marker, sel_mark, c.name, c.key),
+                        style,
+                    )));
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "  ↑↓ 选择 / Enter 确认 / Esc 返回",
+                    Style::default().fg(TuiColor::DarkGray),
+                )));
+                lines
+            }
+            "many_chose" => {
+                let mut lines = vec![Line::from("")];
+                let selected = match &self.values[self.active] {
+                    Some(InputValue::ManyChose(v)) => v.clone(),
+                    _ => Vec::new(),
+                };
+                for (i, c) in def.choose.iter().enumerate() {
+                    let marker = if self.edit.cursor == i { "> " } else { "  " };
+                    let sel_mark = if selected.contains(&i) { "[x]" } else { "[ ]" };
+                    let style = if self.edit.cursor == i {
+                        Style::default().fg(TuiColor::Cyan).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}{} {} [{}]", marker, sel_mark, c.name, c.key),
+                        style,
+                    )));
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "  ↑↓ 移动 / 空格 切换 / Enter 确认 / Esc 返回",
+                    Style::default().fg(TuiColor::DarkGray),
+                )));
+                lines
+            }
+            _ => vec![],
+        };
+
+        let p = Paragraph::new(text).block(Block::default().borders(Borders::ALL).title(title));
+        f.render_widget(p, area);
+    }
+}
+
+fn collect_inputs_sync(defs: Vec<Input>) -> Result<HashMap<String, InputValue>, ()> {
+    // 非终端环境：全部用默认值
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        let app = InputApp::new(defs);
+        return Ok(app.into_map());
+    }
+
+    cterm::enable_raw_mode().map_err(|_| ())?;
+    let mut stdout = std::io::stdout();
+    if execute!(stdout, EnterAlternateScreen).is_err() {
+        cterm::disable_raw_mode().ok();
+        return Err(());
+    }
+
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = match Terminal::new(backend) {
+        Ok(t) => t,
+        Err(_) => {
+            cterm::disable_raw_mode().ok();
+            return Err(());
+        }
+    };
+
+    let mut app = InputApp::new(defs);
+
+    let result: Result<HashMap<String, InputValue>, ()> = loop {
+        if terminal.draw(|f| app.render(f)).is_err() {
+            break Err(());
+        }
+        let ev = match event::read() {
+            Ok(ev) => ev,
+            Err(_) => break Err(()),
+        };
+        if let Event::Key(k) = ev {
+            if k.kind != KeyEventKind::Press {
+                continue;
+            }
+            match app.handle_key(k) {
+                InputAction::Submit => {
+                    if let Some(err) = app.validate() {
+                        app.message = Some(err);
+                    } else {
+                        break Ok(app.into_map());
+                    }
+                }
+                InputAction::Cancel => break Err(()),
+                InputAction::None => {}
+            }
+        }
+    };
+
+    // 恢复终端
+    execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
+    terminal.show_cursor().ok();
+    cterm::disable_raw_mode().ok();
+
+    result
+}
+
 // ============== Engine ==============
 struct Engine {
     tasks: HashMap<String, Task>,
+    task_order: Vec<String>,
     global_vars: HashMap<String, String>,
     global_actioninfo: bool,
     task_depth: usize,
     max_depth: Option<usize>,
+    input_defs: HashMap<String, Input>,
+    input_values: HashMap<String, InputValue>,
 }
 
 impl Engine {
@@ -206,6 +769,8 @@ impl Engine {
         tasks: Vec<Task>,
         global_actioninfo: bool,
         max_depth: MaxDepthSetting,
+        inputs: Vec<Input>,
+        input_values: HashMap<String, InputValue>,
     ) -> Result<Self, String> {
         let max_depth = match max_depth {
             MaxDepthSetting::Num(n) => Some(n),
@@ -218,24 +783,34 @@ impl Engine {
         };
 
         let mut map = HashMap::new();
+        let mut order = Vec::with_capacity(tasks.len());
         for t in tasks {
             let key = t.value.clone();
             if map.contains_key(&key) {
                 return Err(format!("task value 重复: {}", key));
             }
+            order.push(key.clone());
             map.insert(key, t);
         }
+
+        let mut input_defs = HashMap::new();
+        for inp in inputs {
+            input_defs.insert(inp.key.clone(), inp);
+        }
+
         Ok(Self {
             tasks: map,
+            task_order: order,
             global_vars: HashMap::new(),
             global_actioninfo,
             task_depth: 0,
             max_depth,
+            input_defs,
+            input_values,
         })
     }
 }
 
-// ============== 全局 Engine ==============
 static ENGINE: OnceLock<Arc<tokio::sync::Mutex<Engine>>> = OnceLock::new();
 
 fn get_engine() -> Arc<tokio::sync::Mutex<Engine>> {
@@ -293,7 +868,7 @@ impl Command for SetallvarCommand {
 
 // ============== 内建命令：getallvar ==============
 #[derive(Parser, Debug)]
-#[command(name = "getallvar", about = "从全局变量池读取变量并设为当前 shell 变量（唯一读取入口）")]
+#[command(name = "getallvar", about = "从全局变量池读取变量并设为当前 shell 变量")]
 struct GetallvarCommand {
     #[arg(required = true)]
     name: String,
@@ -350,11 +925,9 @@ impl Command for ListallvarCommand {
     ) -> Result<ExecutionResult, Self::Error> {
         let engine = get_engine();
         let e = engine.lock().await;
-
         if e.global_vars.is_empty() {
             return Ok(ExecutionResult::success());
         }
-
         if self.names_only && !self.values {
             for k in e.global_vars.keys() {
                 err_line(k.clone());
@@ -374,9 +947,136 @@ impl Command for ListallvarCommand {
             let keys: Vec<&str> = e.global_vars.keys().map(|s| s.as_str()).collect();
             err_line(keys.join(" "));
         }
+        Ok(ExecutionResult::success())
+    }
+}
+
+// ============== 内建命令：getinput ==============
+#[derive(Parser, Debug)]
+#[command(name = "getinput", about = "读取 TUI 收集的 input 值并写入 shell 变量")]
+struct GetinputCommand {
+    #[arg(required = true)]
+    input_type: String,
+    #[arg(required = true)]
+    key: String,
+    #[arg(required = true)]
+    varname: String,
+}
+
+impl Command for GetinputCommand {
+    type Error = brush_core::Error;
+
+    async fn execute(
+        &self,
+        context: ExecutionContext<'_>,
+    ) -> Result<ExecutionResult, Self::Error> {
+        let engine = get_engine();
+        let e = engine.lock().await;
+
+        let def = match e.input_defs.get(&self.key) {
+            Some(d) => d.clone(),
+            None => {
+                err_line(format!(
+                    "{}[错误] getinput: 未知 input key: {}{}",
+                    color::RED, self.key, color::RESET
+                ));
+                return Ok(ExecutionResult::new(1));
+            }
+        };
+        if def.input_type != self.input_type {
+            err_line(format!(
+                "{}[错误] getinput: type 不匹配 (期望 {} 实际 {}){}",
+                color::RED, def.input_type, self.input_type, color::RESET
+            ));
+            return Ok(ExecutionResult::new(1));
+        }
+
+        let val = e.input_values.get(&self.key).cloned();
+
+        match self.input_type.as_str() {
+            "string" => {
+                let s = match val {
+                    Some(InputValue::String(s)) => s,
+                    _ => String::new(),
+                };
+                set_shell_var(&context, &self.varname, s)?;
+            }
+            "int" => {
+                let s = match val {
+                    Some(InputValue::Int(s)) => s,
+                    _ => String::new(),
+                };
+                set_shell_var(&context, &self.varname, s)?;
+            }
+            "bool" => {
+                let s = match val {
+                    Some(InputValue::Bool(Some(true))) => "true".to_string(),
+                    Some(InputValue::Bool(Some(false))) => "false".to_string(),
+                    _ => String::new(),
+                };
+                set_shell_var(&context, &self.varname, s)?;
+            }
+            "only_chose" => {
+                let s = match val {
+                    Some(InputValue::OnlyChose(Some(i))) => def
+                        .choose
+                        .get(i)
+                        .map(|c| c.key.clone())
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                };
+                set_shell_var(&context, &self.varname, s)?;
+            }
+            "many_chose" => {
+                let arr: Vec<String> = match val {
+                    Some(InputValue::ManyChose(v)) => {
+                        v.iter().map(|i| i.to_string()).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                set_shell_array(&context, &self.varname, arr)?;
+            }
+            _ => {}
+        }
 
         Ok(ExecutionResult::success())
     }
+}
+
+fn set_shell_var(
+    context: &ExecutionContext<'_>,
+    name: &str,
+    value: String,
+) -> Result<(), brush_core::Error> {
+    context
+        .shell
+        .env
+        .update_or_add(
+            name,
+            ShellValueLiteral::Scalar(value),
+            |_| Ok(()),
+            EnvironmentLookup::Anywhere,
+            EnvironmentScope::Global,
+        )
+        .map_err(brush_core::Error::from)
+}
+
+fn set_shell_array(
+    context: &ExecutionContext<'_>,
+    name: &str,
+    items: Vec<String>,
+) -> Result<(), brush_core::Error> {
+    context
+        .shell
+        .env
+        .update_or_add(
+            name,
+            ShellValueLiteral::Array(items),
+            |_| Ok(()),
+            EnvironmentLookup::Anywhere,
+            EnvironmentScope::Global,
+        )
+        .map_err(brush_core::Error::from)
 }
 
 // ============== 创建绑定到 PTY 的 shell ==============
@@ -392,6 +1092,7 @@ async fn create_shell_with_pty(
     builtins_map.insert("setallvar".into(), builtins::builtin::<SetallvarCommand>());
     builtins_map.insert("getallvar".into(), builtins::builtin::<GetallvarCommand>());
     builtins_map.insert("listallvar".into(), builtins::builtin::<ListallvarCommand>());
+    builtins_map.insert("getinput".into(), builtins::builtin::<GetinputCommand>());
 
     let fds = if let Some(pts) = pts {
         let pts_fd = pts.as_raw_fd();
@@ -424,9 +1125,7 @@ async fn create_shell_with_pty(
         .await
         .map_err(|e| format!("创建 shell 失败: {}", e))?;
 
-    // $0 设为任务名（或其它调用者指定的名称）
     shell.shell_name = Some(arg0.to_string());
-    // 位置参数：$1, $2, ...
     shell.positional_parameters = args.to_vec();
     Ok(shell)
 }
@@ -437,6 +1136,7 @@ async fn execute_task(
     value: &str,
     args: &[String],
 ) -> Result<(), i32> {
+    // 1. 取出 task + 检查深度
     let (task, actioninfo) = {
         let mut e = engine.lock().await;
         if let Some(max) = e.max_depth {
@@ -463,9 +1163,7 @@ async fn execute_task(
         (t, ai)
     };
 
-    log_line(actioninfo, 0, "TASK", &task.name, s_start());
-
-    // ── 打开 PTY ──
+    // 2. 打开 PTY
     let (pty, pts) = match pty_process::blocking::open() {
         Ok(p) => p,
         Err(e) => {
@@ -480,28 +1178,25 @@ async fn execute_task(
         }
     };
 
-    // ── 同步 PTY 尺寸到当前终端 ──
+    // 3. 同步 PTY 尺寸
     if let Ok((cols, rows)) = crossterm::terminal::size() {
         let _ = pty.resize(pty_process::Size::new(rows, cols));
     }
 
     let pts = Arc::new(pts);
 
-    // ── 进入 raw mode（保留 ISIG） ──
+    // 4. raw mode
     let raw_guard = RawModeGuard::enter();
 
-    // ── 监听 SIGINT（Ctrl+C）──
-    // 收到后：恢复终端 → 打印中断日志 → 直接退出进程（130 = 128+SIGINT）
+    // 5. SIGINT 监听
     let ctrl_c_task_name = task.name.clone();
     let ctrl_c_actioninfo = actioninfo;
     let ctrl_c_handle = tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            // 恢复终端（不要用 RAII，直接就地恢复，避免退出时还处于 raw mode）
             unsafe {
                 let mut term: libc::termios = std::mem::zeroed();
                 if libc::tcgetattr(libc::STDIN_FILENO, &mut term) == 0 {
                     libc::cfmakeraw(&mut term);
-                    // 加回最常用的几个 flag，恢复"正常"终端
                     term.c_lflag |= libc::ICANON | libc::ECHO | libc::ISIG;
                     term.c_oflag |= libc::OPOST;
                     libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &term);
@@ -514,12 +1209,11 @@ async fn execute_task(
                 &ctrl_c_task_name,
                 s_interrupt(),
             );
-            // 强制退出整个进程
             std::process::exit(130);
         }
     });
 
-    // ── reader 线程：PTY master → stdout ──
+    // 6. reader 线程：PTY master → stdout
     let raw_fd = pty.as_raw_fd();
     let dup_fd = unsafe { libc::dup(raw_fd) };
     if dup_fd < 0 {
@@ -549,8 +1243,7 @@ async fn execute_task(
         }
     });
 
-    // ── writer 线程：mlmake 的 stdin → PTY master ──
-    //    Ctrl-] (0x1d) 作为脱离信号，避免交互式程序无法退出。
+    // 7. writer 线程：stdin → PTY
     let raw_fd_w = pty.as_raw_fd();
     let dup_fd_w = unsafe { libc::dup(raw_fd_w) };
     let _writer_thread = if dup_fd_w >= 0 {
@@ -562,12 +1255,9 @@ async fn execute_task(
                 match stdin.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        // Ctrl+] 脱离
                         if buf[..n].contains(&0x1d) {
                             break;
                         }
-                        // 保险：ISIG 已开启时 0x03 通常到不了这里；
-                        // 若某些终端不产生 SIGINT，则自己中断。
                         if buf[..n].contains(&0x03) {
                             std::process::exit(130);
                         }
@@ -584,7 +1274,7 @@ async fn execute_task(
         None
     };
 
-    // ── 创建绑定到 PTY 的 shell（$0 = task.value） ──
+    // 8. 创建 shell
     let mut shell = match create_shell_with_pty(args, Some(pts), &task.value).await {
         Ok(s) => s,
         Err(err) => {
@@ -600,23 +1290,49 @@ async fn execute_task(
         }
     };
 
-    // ── 跑所有 step ──
+    // 9. run_cond：在同一个 PTY shell 里先跑，非 0 则跳过
+    if let Some(cond) = &task.run_cond {
+        let cond = cond.trim();
+        if !cond.is_empty() {
+            let params = ExecutionParameters::default();
+            let r = shell.run_string(cond.to_string(), &params).await;
+            let passed = matches!(&r, Ok(res) if u8::from(res.exit_code) == 0);
+            if !passed {
+                let reason = match &r {
+                    Ok(res) => format!("run_cond 退出码 {}", u8::from(res.exit_code)),
+                    Err(_) => "run_cond 执行异常".to_string(),
+                };
+                log_line(actioninfo, 0, "TASK", &task.name, s_skip(&reason));
+                drop(shell);
+                drop(pty);
+                let _ = reader_thread.join();
+                ctrl_c_handle.abort();
+                drop(raw_guard);
+                {
+                    let mut e = engine.lock().await;
+                    e.task_depth -= 1;
+                }
+                if let Some(t) = _writer_thread {
+                    let _ = t;
+                }
+                return Ok(());
+            }
+        }
+    }
+
+    // 10. 真正开始
+    log_line(actioninfo, 0, "TASK", &task.name, s_start());
+
     let result = run_steps(&task.steps, &mut shell, actioninfo).await;
 
-    // ── 清理 ──
+    // 11. 清理
     drop(shell);
     drop(pty);
     let _ = reader_thread.join();
-
-    // 取消 SIGINT 监听（如果没触发，则正常取消）
     ctrl_c_handle.abort();
-
-    // writer 线程可能仍阻塞在 stdin.read() 上，让它在进程结束时自动消失。
     if let Some(t) = _writer_thread {
         let _ = t;
     }
-
-    // 恢复终端
     drop(raw_guard);
 
     {
@@ -670,17 +1386,18 @@ async fn run_actions(acts: &[Action], shell: &mut BrushShell) -> Result<(), i32>
     Ok(())
 }
 
-// ============== run_one：所有命令都通过 PTY 上的 shell 执行 ==============
 async fn run_one(a: &Action, shell: &mut BrushShell) -> Result<(), i32> {
     let script = a.run.trim();
-
     let params = ExecutionParameters::default();
     let result = shell.run_string(script.to_string(), &params).await;
-
     match result {
         Ok(exec_result) => {
             let code = u8::from(exec_result.exit_code) as i32;
-            if code == 0 { Ok(()) } else { Err(code) }
+            if code == 0 {
+                Ok(())
+            } else {
+                Err(code)
+            }
         }
         Err(e) => {
             err_line(format!("{}[错误] 执行失败: {}{}", color::RED, e, color::RESET));
@@ -690,12 +1407,38 @@ async fn run_one(a: &Action, shell: &mut BrushShell) -> Result<(), i32> {
 }
 
 // ============== 校验 ==============
-fn validate(tasks: &[Task]) -> Result<(), String> {
-    let mut vals = std::collections::HashSet::new();
-    for t in tasks {
-        let key = t.value.clone();
-        if !vals.insert(key.clone()) {
-            return Err(format!("task value 重复: {}", key));
+fn validate(b: &BuildFile) -> Result<(), String> {
+    let mut task_vals = HashSet::new();
+    for t in &b.tasks {
+        if !task_vals.insert(t.value.clone()) {
+            return Err(format!("task value 重复: {}", t.value));
+        }
+    }
+    let mut input_keys = HashSet::new();
+    for i in &b.inputs {
+        if !input_keys.insert(i.key.clone()) {
+            return Err(format!("input key 重复: {}", i.key));
+        }
+        match i.input_type.as_str() {
+            "string" | "int" | "bool" => {}
+            "only_chose" | "many_chose" => {
+                if i.choose.len() < 2 {
+                    return Err(format!(
+                        "input `{}` (type={}) 需要至少 2 个 [[input.choose]]",
+                        i.name, i.input_type
+                    ));
+                }
+                let mut ck = HashSet::new();
+                for c in &i.choose {
+                    if !ck.insert(c.key.clone()) {
+                        return Err(format!(
+                            "input `{}` 中 choose key 重复: {}",
+                            i.name, c.key
+                        ));
+                    }
+                }
+            }
+            other => return Err(format!("未知 input type: {}", other)),
         }
     }
     Ok(())
@@ -707,26 +1450,30 @@ fn print_help() {
         concat!(
             "{B}{N}{R} v{V}\n\n",
             "用法:\n",
-            "  {N} [--cfg <file.toml>] <task> [args...]\n",
-            "  {N} [--cfg <file.toml>] list [all|task] [step]\n",
-            "  {N} [--cfg <file.toml>] task <task> [args...]\n",
+            "  {N} <config.toml>\n",
             "  {N} --help|-h\n",
             "  {N} --version|-V\n\n",
             "说明:\n",
-            "  每个 task 拥有独立、干净的 shell 实例，cd/export 只影响当前 task。\n",
-            "  同一个 task 的所有命令共享同一个 PTY 终端，stdin/stdout 双向转发，\n",
-            "  支持 read -p、vim、top 等交互式程序。\n",
-            "  交互中按 Ctrl-] 可脱离当前 PTY 会话。\n",
-            "  交互中按 Ctrl+C 可中止当前 task（并退出 mlmake）。\n",
-            "  参数传递：$0 = task.value，$1..$n = 命令行附加参数。\n",
-            "  全局变量池没有任何自动同步：\n",
-            "    写入请用 setallvar <name> <value>\n",
-            "    读取请用 getallvar <name>（会设为当前 shell 变量）\n",
-            "    查看请用 listallvar [-n|-v|-nv]\n\n",
+            "  按顺序执行配置文件中的所有 [[task]]。\n",
+            "  每个 task 拥有独立、干净的 PTY shell，cd/export 只影响当前 task。\n",
+            "  同一个 task 的所有命令共享同一个 PTY 终端，支持 read -p、vim、top 等。\n",
+            "  交互中按 Ctrl-] 可脱离当前 PTY 会话；Ctrl+C 可中止当前 task。\n",
+            "  如果配置中定义了 [[input]]，启动时会先弹 TUI 收集输入。\n",
+            "    主界面回车进入填写页；Tab 在 [取消] [确认] [填写] 之间切换。\n",
+            "    string/int：直接输入（int 只接受数字）；bool/only_chose：上下选；\n",
+            "    many_chose：上下移动 + 空格切换选中；Enter 确认，Esc 返回主界面。\n",
+            "  在 task 的脚本中取值：\n",
+            "    getinput string     <key> <varname>\n",
+            "    getinput int        <key> <varname>\n",
+            "    getinput bool       <key> <varname>     # true / false（小写）\n",
+            "    getinput only_chose <key> <varname>     # 选项的 key\n",
+            "    getinput many_chose <key> <varname>     # 索引数组，如 arr=(0 2)\n",
+            "  task 级别的 run_cond：在 PTY 内先执行，非 0 则跳过该 task。\n",
+            "  task 级别的 require_success = true：若紧邻前一个 task 失败，则跳过该 task。\n\n",
             "配置 [settings] 项:\n",
             "  actioninfo = true|false   # 是否输出日志，默认 true\n",
             "  max_depth  = 64           # 最大递归层数，默认 64；\n",
-            "                            # 设为 false 表示不限制（只允许 false，写 true 会报错）\n",
+            "                            # 设为 false 表示不限制（只允许 false）\n",
         ),
         B = color::BOLD,
         R = color::RESET,
@@ -755,69 +1502,55 @@ fn load_build(cfg_path: &str) -> BuildFile {
     }
 }
 
-fn cmd_list(b: &BuildFile, args: &[String]) {
-    if args.is_empty() {
-        println!("{}可用任务:{}", color::BOLD, color::RESET);
-        for t in &b.tasks {
-            let tag = if t.cmduse {
-                format!("{}[cmduse]{}", color::GREEN, color::RESET)
-            } else {
-                format!("{}[内部]{}", color::DIM, color::RESET)
+// ============== 顺序执行所有 task ==============
+async fn run_all(engine: Arc<tokio::sync::Mutex<Engine>>) -> i32 {
+    let task_values: Vec<String> = {
+        let e = engine.lock().await;
+        e.task_order.clone()
+    };
+
+    let mut last: Option<Result<(), i32>> = None;
+
+    for value in &task_values {
+        let (require_success, actioninfo, name) = {
+            let e = engine.lock().await;
+            let t = match e.tasks.get(value) {
+                Some(t) => t,
+                None => continue,
             };
-            println!("    {:<12} {:<16} {}", t.value, t.name, tag);
-        }
-        return;
-    }
-    if args[0] == "all" && args.get(1).map(|s| s.as_str()) == Some("step") {
-        for t in &b.tasks {
-            println!(
-                "{}TASK{} : {} ({})",
-                color::CYAN, color::RESET, t.name, t.value
-            );
-            for s in &t.steps {
-                println!("    {}STEP{} : {}", color::BLUE, color::RESET, s.name);
-            }
-        }
-        return;
-    }
-    if args.get(1).map(|s| s.as_str()) == Some("step") {
-        match b.tasks.iter().find(|t| t.value == args[0]) {
-            Some(t) => {
-                println!(
-                    "{}TASK{} : {} ({})",
-                    color::CYAN, color::RESET, t.name, t.value
+            (
+                t.require_success,
+                t.settings.actioninfo.unwrap_or(e.global_actioninfo),
+                t.name.clone(),
+            )
+        };
+
+        if require_success {
+            if let Some(Err(c)) = last {
+                log_line(
+                    actioninfo,
+                    0,
+                    "TASK",
+                    &name,
+                    s_skip(&format!("前置失败 {}", c)),
                 );
-                for s in &t.steps {
-                    println!("    {}STEP{} : {}", color::BLUE, color::RESET, s.name);
-                }
-            }
-            None => {
-                eprintln!(
-                    "{}[错误] 找不到 task: {}{}",
-                    color::RED, args[0], color::RESET
-                );
-                std::process::exit(1);
+                last = Some(Err(c));
+                continue;
             }
         }
-        return;
+
+        let r = execute_task(engine.clone(), value, &[]).await;
+        last = Some(r);
     }
-    eprintln!("{}[错误] 无法识别的 list 参数{}", color::RED, color::RESET);
-    std::process::exit(1);
+
+    match last {
+        Some(Err(c)) => c.max(1),
+        _ => 0,
+    }
 }
 
-#[tokio::main]
-async fn main() {
-    let mut args: Vec<String> = std::env::args().collect();
-
-    let mut cfg_path = String::from("build.toml");
-    if args.len() >= 2 && args[1] == "--cfg" {
-        if args.len() < 3 {
-            eprintln!("{}[错误] --cfg 缺少文件路径{}", color::RED, color::RESET);
-            std::process::exit(1);
-        }
-        cfg_path = args[2].clone();
-        args.drain(1..3);
-    }
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
 
     if args
         .get(1)
@@ -840,50 +1573,39 @@ async fn main() {
         return;
     }
 
-    let build = load_build(&cfg_path);
-    if let Err(e) = validate(&build.tasks) {
+    let cfg_path = &args[1];
+    let build = load_build(cfg_path);
+
+    if let Err(e) = validate(&build) {
         eprintln!("{}[错误] {}{}", color::RED, e, color::RESET);
         std::process::exit(1);
     }
 
-    let cmd = args[1].as_str();
-
-    let (target, task_args) = if cmd == "task" {
-        if args.len() < 3 {
-            eprintln!("{}[错误] task 缺少任务名{}", color::RED, color::RESET);
-            std::process::exit(1);
-        }
-        (args[2].clone(), args[3..].to_vec())
-    } else {
-        if cmd == "list" {
-            cmd_list(&build, &args[2..]);
-            return;
-        }
-        (args[1].clone(), args[2..].to_vec())
-    };
-
-    let task = match build.tasks.iter().find(|t| t.value == target) {
-        Some(t) => t,
-        None => {
-            eprintln!(
-                "{}[错误] 找不到 task: {}{}",
-                color::RED, target, color::RESET
-            );
-            std::process::exit(1);
-        }
-    };
-    if !task.cmduse {
-        eprintln!(
-            "{}[错误] task `{}` 不可命令行调用 (cmduse=false){}",
-            color::RED, target, color::RESET
-        );
+    if build.tasks.is_empty() {
+        eprintln!("{}[错误] 配置中没有任何 [[task]]{}", color::RED, color::RESET);
         std::process::exit(1);
     }
 
+    // 先收集输入（同步 TUI，位于 tokio runtime 之外）
+    let input_values: HashMap<String, InputValue> = if !build.inputs.is_empty() {
+        match collect_inputs_sync(build.inputs.clone()) {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!("\r\n{}[已取消输入]{}", color::RED, color::RESET);
+                std::process::exit(130);
+            }
+        }
+    } else {
+        HashMap::new()
+    };
+
+    // 构建 engine
     let engine = match Engine::new(
         build.tasks,
         build.settings.actioninfo,
         build.settings.max_depth,
+        build.inputs,
+        input_values,
     ) {
         Ok(e) => e,
         Err(err) => {
@@ -894,9 +1616,14 @@ async fn main() {
     let engine_arc = Arc::new(tokio::sync::Mutex::new(engine));
     let _ = ENGINE.set(engine_arc.clone());
 
-    let code = match execute_task(engine_arc, &target, &task_args).await {
-        Ok(()) => 0,
-        Err(c) => c.max(1),
+    // 进入 async 世界
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{}[错误] 创建 runtime 失败: {}{}", color::RED, e, color::RESET);
+            std::process::exit(1);
+        }
     };
+    let code = runtime.block_on(run_all(engine_arc));
     std::process::exit(code);
 }
